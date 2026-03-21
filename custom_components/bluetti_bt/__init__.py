@@ -5,15 +5,17 @@ import asyncio
 import re
 import logging
 from typing import List
-from homeassistant.components import bluetooth
+from homeassistant.components import bluetooth as ha_bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.exceptions import ConfigEntryNotReady
 
+from .bluetooth.device_connection import DeviceConnection
 from .utils import mac_loggable
 from .const import (
+    DATA_CONNECTION,
     DATA_COORDINATOR,
     DATA_LOCK,
     DOMAIN,
@@ -44,15 +46,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     logger.debug("Init Bluetti BT Integration")
 
-    if not bluetooth.async_address_present(hass, config.address):
+    if not ha_bluetooth.async_address_present(hass, config.address):
         raise ConfigEntryNotReady("Bluetti device not present")
 
     # Create data structure
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
 
-    # Create lock
+    # Create shared BLE connection, lock, and write_pending event
     lock = asyncio.Lock()
+    write_pending = asyncio.Event()
+    connection = DeviceConnection(
+        config.address,
+        use_encryption=config.use_encryption,
+        max_retries=config.max_retries,
+    )
+
+    hass.data[DOMAIN][entry.entry_id][DATA_LOCK] = lock
+    hass.data[DOMAIN][entry.entry_id][DATA_CONNECTION] = connection
 
     # Create coordinator for polling
     logger.debug("Creating coordinator")
@@ -60,10 +71,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         config,
         lock,
+        write_pending,
+        connection,
     )
     await coordinator.async_config_entry_first_refresh()
-    hass.data[DOMAIN][entry.entry_id].setdefault(DATA_COORDINATOR, coordinator)
-    hass.data[DOMAIN][entry.entry_id].setdefault(DATA_LOCK, lock)
+    hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR] = coordinator
 
     logger.debug("Creating entities")
     # Setup platforms
@@ -72,6 +84,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     logger.debug("Setup done")
 
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload Bluetti Powerstation config entry."""
+    connection = hass.data[DOMAIN][entry.entry_id].get(DATA_CONNECTION)
+    if connection is not None:
+        await connection.disconnect()
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
 def device_info(entry: ConfigEntry):

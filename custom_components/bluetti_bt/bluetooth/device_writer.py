@@ -1,0 +1,181 @@
+import asyncio
+import logging
+import time
+from typing import Any
+
+import async_timeout
+from bleak import BleakClient
+from bleak.exc import BleakError
+
+from bluetti_bt_lib.const import NOTIFY_UUID, WRITE_UUID
+from bluetti_bt_lib.base_devices import BluettiDevice
+from bluetti_bt_lib.bluetooth.encryption import BluettiEncryption, Message, MessageType
+
+from .device_connection import DeviceConnection
+
+
+class DeviceWriterConfig:
+    def __init__(self, timeout: int = 15, use_encryption: bool = False) -> None:
+        self.timeout = timeout
+        self.use_encryption = use_encryption
+
+
+class DeviceWriter:
+    def __init__(
+        self,
+        bleak_client: BleakClient | None,
+        bluetti_device: BluettiDevice,
+        config: DeviceWriterConfig = DeviceWriterConfig(),
+        lock: asyncio.Lock = asyncio.Lock(),
+        connection: DeviceConnection | None = None,
+    ) -> None:
+        self.client = bleak_client
+        self.bluetti_device = bluetti_device
+        self.config = config
+        self.polling_lock = lock
+        self.connection = connection
+        self._encryption = BluettiEncryption()
+        self._handshake_complete: asyncio.Event | None = None
+        self.logger = logging.getLogger(__name__)
+
+    async def write(self, field: str, value: Any) -> None:
+        command = self._build_write_command(field, value)
+        if command is None:
+            return
+
+        async with self.polling_lock:
+            try:
+                async with async_timeout.timeout(self.config.timeout):
+                    t0 = time.monotonic()
+
+                    await self._connect_if_needed()
+                    t1 = time.monotonic()
+
+                    command_bytes = await self._prepare_command_bytes(bytes(command))
+                    t2 = time.monotonic()
+
+                    await self._active_client().write_gatt_char(WRITE_UUID, command_bytes)
+                    t3 = time.monotonic()
+
+                    self.logger.warning(
+                        "[TIMING] write %s: connect=%.2fs prepare=%.2fs gatt=%.2fs total=%.2fs",
+                        field, t1 - t0, t2 - t1, t3 - t2, t3 - t0,
+                    )
+            except TimeoutError:
+                self.logger.warning("Timeout writing to device")
+            except BleakError as err:
+                self.logger.warning("Bleak error: %s", err)
+            except Exception as err:
+                self.logger.warning("Unknown error: %s", err)
+            finally:
+                await self._cleanup()
+
+    def _build_write_command(self, field: str, value: Any) -> Any:
+        """Validate field and build the Modbus write command. Returns None if invalid."""
+        if field not in [f.name for f in self.bluetti_device.fields]:
+            self.logger.error("Field not supported: %s", field)
+            return None
+        command = self.bluetti_device.build_write_command(field, value)
+        if command is None:
+            self.logger.error("Field is not writeable: %s", field)
+        return command
+
+    def _active_client(self) -> BleakClient | None:
+        """Return the BleakClient to use — shared connection or own client."""
+        if self.connection is not None:
+            return self.connection.client
+        return self.client
+
+    async def _connect_if_needed(self) -> None:
+        if self.connection is not None:
+            await self.connection.ensure_connected()
+        elif not self.client.is_connected:
+            self.logger.debug("Connecting to device")
+            await self.client.connect()
+
+    async def _prepare_command_bytes(self, raw_bytes: bytes) -> bytes:
+        """Return command bytes ready to send: plain or AES-encrypted."""
+        if not self.config.use_encryption:
+            return raw_bytes
+        if self.connection is not None:
+            return self._encrypt_with_shared_session(raw_bytes)
+        await self._complete_encryption_handshake()
+        return self._encrypt_with_own_session(raw_bytes)
+
+    def _encrypt_with_shared_session(self, data: bytes) -> bytes:
+        """Encrypt using the session key already established by DeviceConnection."""
+        enc = self.connection.encryption
+        return enc.aes_encrypt(data, enc.secure_aes_key, None)
+
+    def _encrypt_with_own_session(self, data: bytes) -> bytes:
+        """Encrypt using the session key established by this writer's own handshake."""
+        return self._encryption.aes_encrypt(data, self._encryption.secure_aes_key, None)
+
+    async def _complete_encryption_handshake(self) -> None:
+        """Subscribe to BLE notifications and wait until ECDH key exchange is complete."""
+        self._handshake_complete = asyncio.Event()
+        await self.client.start_notify(NOTIFY_UUID, self._on_encryption_message)
+        self.logger.debug("Waiting for encryption handshake")
+        try:
+            await asyncio.wait_for(self._handshake_complete.wait(), timeout=12)
+        except asyncio.TimeoutError:
+            raise TimeoutError("Encryption handshake timed out")
+        self.logger.debug("Encryption handshake complete")
+
+    async def _cleanup(self) -> None:
+        if self.connection is not None:
+            return  # Shared connection outlives this write — do not touch it
+        await self._teardown_own_connection()
+
+    async def _teardown_own_connection(self) -> None:
+        """Stop notifications, reset encryption, and disconnect own client."""
+        if self.config.use_encryption:
+            try:
+                await self.client.stop_notify(NOTIFY_UUID)
+            except Exception:
+                pass
+            self._encryption.reset()
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+
+    async def _on_encryption_message(self, _sender: int, data: bytearray) -> None:
+        """Dispatch each BLE notification to the appropriate handshake handler."""
+        message = Message(data)
+        if message.is_pre_key_exchange:
+            await self._handle_pre_key_message(message)
+        else:
+            await self._handle_encrypted_handshake_message(message)
+
+    async def _handle_pre_key_message(self, message: Message) -> None:
+        """Handle unencrypted handshake messages: challenge and challenge-accepted."""
+        message.verify_checksum()
+        if message.type == MessageType.CHALLENGE:
+            self.logger.debug("Received challenge, sending response")
+            response = self._encryption.msg_challenge(message)
+            await self.client.write_gatt_char(WRITE_UUID, response)
+        elif message.type == MessageType.CHALLENGE_ACCEPTED:
+            self.logger.debug("Challenge accepted, starting key exchange")
+
+    async def _handle_encrypted_handshake_message(self, message: Message) -> None:
+        """Handle encrypted handshake messages: peer public key and key-accepted."""
+        if self._encryption.unsecure_aes_key is None:
+            self.logger.warning("Received encrypted message before challenge was completed")
+            return
+
+        key, iv = self._encryption.getKeyIv()
+        decrypted = Message(self._encryption.aes_decrypt(message.buffer, key, iv))
+
+        if not decrypted.is_pre_key_exchange:
+            return
+
+        decrypted.verify_checksum()
+        if decrypted.type == MessageType.PEER_PUBKEY:
+            self.logger.debug("Received peer public key, sending ours")
+            response = self._encryption.msg_peer_pubkey(decrypted)
+            await self.client.write_gatt_char(WRITE_UUID, response)
+        elif decrypted.type == MessageType.PUBKEY_ACCEPTED:
+            self.logger.debug("Key exchange complete, shared secret established")
+            self._encryption.msg_key_accepted(decrypted)
+            self._handshake_complete.set()
